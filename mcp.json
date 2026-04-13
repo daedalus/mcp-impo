@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mcp-impo": {
+      "command": "mcp-impo",
+      "env": {}
+    }
+  }
+}
