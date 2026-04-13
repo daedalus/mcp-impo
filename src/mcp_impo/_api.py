@@ -45,7 +45,7 @@ def get_schema(ttl: int | None = None) -> dict[str, Any]:
 
         return json.loads(cached)  # type: ignore[no-any-return]  # type: ignore[no-any-return]
 
-    response = httpx.get(SCHEMA_URL, timeout=30.0)
+    response = httpx.get(SCHEMA_URL, timeout=30.0, follow_redirects=True)
     response.raise_for_status()
     data: dict[str, Any] = response.json()
 
@@ -87,6 +87,7 @@ def get_norma(
     path = "/".join(parts)
 
     url = f"{BASE_URL}/bases/{path}?json=true"
+    # Follow redirects as IMPO may change URL structure
     ttl_value = ttl if ttl is not None else NORMAS_TTL
 
     cached = cache.get(url, ttl_value)
@@ -96,7 +97,7 @@ def get_norma(
         return json.loads(cached)  # type: ignore[no-any-return]
 
     try:
-        response = httpx.get(url, timeout=30.0)
+        response = httpx.get(url, timeout=30.0, follow_redirects=True)
         if response.status_code == 404:
             return None
         response.raise_for_status()
@@ -116,8 +117,9 @@ def search_normas(
 ) -> list[dict[str, Any]]:
     """Search for normas or avisos in IMPO database.
 
-    Performs a search across IMPO's database of Uruguayan legislation
-    and official notices.
+    NOTE: The IMPO /bases/search endpoint now redirects to /search_gcse/
+    which returns HTML instead of JSON. This function falls back to using
+    the base_info endpoint to search for matching normas.
 
     Args:
         query: Search query string
@@ -134,8 +136,9 @@ def search_normas(
         >>> len(results)
         10
     """
-    cache = get_cache_manager()
+    import json
 
+    cache = get_cache_manager()
     limit = min(limit, 100)
 
     params: dict[str, str | int] = {"q": query, "limit": limit}
@@ -149,16 +152,69 @@ def search_normas(
 
     cached = cache.get(url, ttl_value, params=params)
     if cached:
-        import json
-
         return json.loads(cached)  # type: ignore[no-any-return]
 
-    response = httpx.get(url, params=params, timeout=30.0)
-    response.raise_for_status()
-    data: list[dict[str, Any]] = response.json()
+    try:
+        response = httpx.get(url, params=params, timeout=30.0, follow_redirects=True)
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "")
 
-    cache.set(url, response.content, ttl_value, params=params)
+        if "application/json" not in content_type:
+            data: list[dict[str, Any]] = _search_via_base_info(query, tipo, anio, limit)
+            cache_content = json.dumps(data).encode()
+        else:
+            data = response.json()
+            cache_content = response.content
+
+    except httpx.HTTPStatusError:
+        data = _search_via_base_info(query, tipo, anio, limit)
+        cache_content = json.dumps(data).encode()
+
+    cache.set(url, cache_content, ttl_value, params=params)
     return data
+
+
+def _search_via_base_info(
+    query: str,
+    tipo: str | None = None,
+    anio: int | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Fallback search using base_info endpoint.
+
+    IMPO deprecated /bases/search JSON endpoint, so we search by
+    fetching all bases and filtering locally.
+    """
+    query_lower = query.lower()
+    results: list[dict[str, Any]] = []
+    seen = set()
+
+    bases = get_base_info()
+    for base in bases:
+        nombre = base.get("nombre", "").lower()
+        if query_lower in nombre:
+            nombre_orig = base.get("nombre", "")
+            key = f"{base.get('tipo', '')}-{base.get('anio', '')}-{nombre_orig}"
+            if key not in seen:
+                seen.add(key)
+                results.append(
+                    {
+                        "tipoNorma": base.get("tipo", ""),
+                        "nroNorma": base.get("nro", ""),
+                        "anioNorma": base.get("anio", 0),
+                        "nombreNorma": nombre_orig,
+                    }
+                )
+
+            if len(results) >= limit:
+                break
+
+    if tipo:
+        results = [r for r in results if r.get("tipoNorma", "").lower() == tipo.lower()]
+    if anio:
+        results = [r for r in results if r.get("anioNorma") == anio]
+
+    return results[:limit]
 
 
 def get_base_info(ttl: int | None = None) -> list[dict[str, Any]]:
@@ -186,7 +242,7 @@ def get_base_info(ttl: int | None = None) -> list[dict[str, Any]]:
 
         return json.loads(cached)  # type: ignore[no-any-return]
 
-    response = httpx.get(BASE_INFO_URL, timeout=30.0)
+    response = httpx.get(BASE_INFO_URL, timeout=30.0, follow_redirects=True)
     response.raise_for_status()
     data: list[dict[str, Any]] = response.json()
 
